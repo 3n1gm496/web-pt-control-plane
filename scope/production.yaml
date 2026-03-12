@@ -4,5 +4,5 @@ description: >
   Explicit allowlist for passive production checks. Replace the example hosts
   with domains you own before exposing the API.
 hosts:
-  - www.camera.it
-  - servizi.camera.it  
+  - example.com
+  - example2.com  
