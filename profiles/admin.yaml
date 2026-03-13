@@ -1,0 +1,5 @@
+headers:
+  X-Debug-Role: admin
+cookies:
+  session: ${ADMIN_SESSION:-}
+bearer_token: ${ADMIN_BEARER_TOKEN:-}

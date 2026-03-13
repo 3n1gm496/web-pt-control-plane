@@ -42,6 +42,11 @@ checks:
     parse_html_only_for_link_extraction: true
   authorization_matrix:
     enabled: true
+    profiles_dir: profiles
+    expected_profiles:
+      - guest
+      - user
+      - admin
     max_endpoints: 20
     compare_headers:
       - cache-control
@@ -55,16 +60,6 @@ checks:
       - access denied
       - admin
       - dashboard
-    profiles:
-      guest:
-        headers: {}
-        cookies: {}
-      user:
-        headers: {}
-        cookies: {}
-      admin:
-        headers: {}
-        cookies: {}
 safety:
   destructive_tests: false
   require_scope_allowlist: true

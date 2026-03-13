@@ -1,0 +1,5 @@
+headers:
+  X-Debug-Role: user
+cookies:
+  session: ${USER_SESSION:-}
+bearer_token: ${USER_BEARER_TOKEN:-}

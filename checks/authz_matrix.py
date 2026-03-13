@@ -7,16 +7,10 @@ from urllib.parse import urlsplit
 import httpx
 
 from checks.endpoint_inventory import InventoryEndpoint, InventoryReport, crawl_inventory
+from checks.request_profiles import RequestProfile
 
 OBJECT_REFERENCE_SEGMENTS = {'user', 'users', 'order', 'orders', 'account', 'accounts'}
 DEFAULT_BODY_MARKERS = ['login', 'sign in', 'unauthorized', 'forbidden', 'access denied', 'admin', 'dashboard']
-
-
-@dataclass(frozen=True)
-class RoleProfile:
-    name: str
-    headers: dict[str, str]
-    cookies: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -34,6 +28,7 @@ class ProfileObservation:
     content_length: int
     selected_headers: dict[str, str | None]
     body_markers: dict[str, bool]
+    loaded: bool
 
 
 @dataclass(frozen=True)
@@ -81,21 +76,6 @@ class AuthorizationMatrixReport:
                 for endpoint in self.endpoints
             ],
         }
-
-
-def build_role_profiles(config: dict[str, Any] | None) -> list[RoleProfile]:
-    config = config or {}
-    profiles: list[RoleProfile] = []
-    for name in ('guest', 'user', 'admin'):
-        profile = config.get(name, {})
-        profiles.append(
-            RoleProfile(
-                name=name,
-                headers={str(key): str(value) for key, value in (profile.get('headers') or {}).items()},
-                cookies={str(key): str(value) for key, value in (profile.get('cookies') or {}).items()},
-            )
-        )
-    return profiles
 
 
 def classify_endpoint(url: str) -> EndpointClassification:
@@ -146,21 +126,17 @@ def classify_endpoint(url: str) -> EndpointClassification:
     else:
         category = 'public'
 
-    return EndpointClassification(
-        category=category,
-        tags=list(dict.fromkeys(tags)),
-        rationale=list(dict.fromkeys(rationale)),
-    )
+    return EndpointClassification(category=category, tags=list(dict.fromkeys(tags)), rationale=list(dict.fromkeys(rationale)))
 
 
 def fetch_profile_observation(
     client: httpx.Client,
     endpoint: InventoryEndpoint,
-    profile: RoleProfile,
+    profile: RequestProfile,
     compare_headers: list[str],
     body_markers: list[str],
 ) -> ProfileObservation:
-    response = client.get(endpoint.url, headers=profile.headers, cookies=profile.cookies, follow_redirects=False)
+    response = client.get(endpoint.url, headers=profile.to_headers(), cookies=profile.cookies, follow_redirects=False)
     lowered_body = response.text.lower()
     return ProfileObservation(
         profile=profile.name,
@@ -169,14 +145,11 @@ def fetch_profile_observation(
         content_length=len(response.text.encode('utf-8')),
         selected_headers={header: response.headers.get(header) for header in compare_headers},
         body_markers={marker: marker.lower() in lowered_body for marker in body_markers},
+        loaded=profile.loaded,
     )
 
 
-def compare_observations(
-    endpoint: InventoryEndpoint,
-    classification: EndpointClassification,
-    observations: list[ProfileObservation],
-) -> list[AuthzFinding]:
+def compare_observations(endpoint: InventoryEndpoint, classification: EndpointClassification, observations: list[ProfileObservation]) -> list[AuthzFinding]:
     findings: list[AuthzFinding] = []
     by_profile = {observation.profile: observation for observation in observations}
     guest = by_profile.get('guest')
@@ -185,51 +158,19 @@ def compare_observations(
 
     if guest and admin and guest.status_code == admin.status_code and guest.redirect_location == admin.redirect_location:
         if 'privileged' in classification.tags:
-            findings.append(
-                AuthzFinding(
-                    severity='medium',
-                    title='Privileged endpoint looks equally reachable to guest',
-                    detail='Guest and admin received the same status code and redirect behavior on a privileged endpoint.',
-                    endpoint=endpoint.url,
-                    profiles=['guest', 'admin'],
-                )
-            )
+            findings.append(AuthzFinding('medium', 'Privileged endpoint looks equally reachable to guest', 'Guest and admin received the same status code and redirect behavior on a privileged endpoint.', endpoint.url, ['guest', 'admin']))
 
     if guest and user and guest.status_code == user.status_code and abs(guest.content_length - user.content_length) <= 32:
         if classification.category in {'authenticated', 'object-reference-candidate'}:
-            findings.append(
-                AuthzFinding(
-                    severity='medium',
-                    title='Authenticated-looking endpoint appears similar for guest and user',
-                    detail='Guest and user responses are close in status and size for an endpoint that may require authentication.',
-                    endpoint=endpoint.url,
-                    profiles=['guest', 'user'],
-                )
-            )
+            findings.append(AuthzFinding('medium', 'Authenticated-looking endpoint appears similar for guest and user', 'Guest and user responses are close in status and size for an endpoint that may require authentication.', endpoint.url, ['guest', 'user']))
 
     if 'object-reference-candidate' in classification.tags and guest and user:
         if guest.status_code != user.status_code or guest.body_markers != user.body_markers or guest.selected_headers != user.selected_headers:
-            findings.append(
-                AuthzFinding(
-                    severity='medium',
-                    title='Object-reference candidate varies across profiles',
-                    detail='An object-like endpoint responded differently across profiles and may be worth manual IDOR review.',
-                    endpoint=endpoint.url,
-                    profiles=['guest', 'user'],
-                )
-            )
+            findings.append(AuthzFinding('medium', 'Object-reference candidate varies across profiles', 'An object-like endpoint responded differently across profiles and may be worth manual IDOR review.', endpoint.url, ['guest', 'user']))
 
     if guest and user and admin:
         if len({guest.status_code, user.status_code, admin.status_code}) >= 2 or len({guest.redirect_location, user.redirect_location, admin.redirect_location}) >= 2:
-            findings.append(
-                AuthzFinding(
-                    severity='info',
-                    title='Endpoint response varies across profiles',
-                    detail='Status code or redirect location differs across guest, user and admin.',
-                    endpoint=endpoint.url,
-                    profiles=['guest', 'user', 'admin'],
-                )
-            )
+            findings.append(AuthzFinding('info', 'Endpoint response varies across profiles', 'Status code or redirect location differs across guest, user and admin.', endpoint.url, ['guest', 'user', 'admin']))
 
     return findings
 
@@ -246,19 +187,11 @@ def analyze_authorization_matrix(
     max_endpoints: int = 20,
     compare_headers: list[str] | None = None,
     body_markers: list[str] | None = None,
-    profiles: dict[str, Any] | None = None,
+    profiles: list[RequestProfile] | None = None,
 ) -> AuthorizationMatrixReport:
-    inventory = crawl_inventory(
-        seed_url,
-        allowed_hosts=allowed_hosts,
-        timeout_seconds=timeout_seconds,
-        max_redirects=max_redirects,
-        user_agent=user_agent,
-        max_pages=inventory_max_pages,
-        max_depth=inventory_max_depth,
-    )
+    inventory = crawl_inventory(seed_url, allowed_hosts=allowed_hosts, timeout_seconds=timeout_seconds, max_redirects=max_redirects, user_agent=user_agent, max_pages=inventory_max_pages, max_depth=inventory_max_depth)
 
-    role_profiles = build_role_profiles(profiles)
+    role_profiles = profiles or []
     headers_to_compare = compare_headers or ['cache-control', 'location', 'content-type']
     markers = body_markers or DEFAULT_BODY_MARKERS
     endpoints = inventory.endpoints[:max_endpoints]
@@ -271,21 +204,6 @@ def analyze_authorization_matrix(
             observations = [fetch_profile_observation(client, endpoint, profile, headers_to_compare, markers) for profile in role_profiles]
             findings = compare_observations(endpoint, classification, observations)
             all_findings.extend(findings)
-            endpoint_reports.append(
-                EndpointAuthzReport(
-                    endpoint=endpoint.url,
-                    requested_url=endpoint.requested_url,
-                    classification=classification,
-                    observations=observations,
-                    findings=findings,
-                )
-            )
+            endpoint_reports.append(EndpointAuthzReport(endpoint.url, endpoint.requested_url, classification, observations, findings))
 
-    return AuthorizationMatrixReport(
-        seed_url=seed_url,
-        inventory=inventory,
-        profiles=[profile.name for profile in role_profiles],
-        endpoints_analyzed=len(endpoint_reports),
-        findings=all_findings,
-        endpoints=endpoint_reports,
-    )
+    return AuthorizationMatrixReport(seed_url, inventory, [profile.name for profile in role_profiles], len(endpoint_reports), all_findings, endpoint_reports)
