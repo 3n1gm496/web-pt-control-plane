@@ -1,18 +1,16 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from typing import Any
-from urllib.parse import urlparse
 
-import httpx
+from checks.http_probe import ResponseSnapshot
 
 REQUIRED_HEADERS = (
-    "Content-Security-Policy",
-    "X-Frame-Options",
-    "X-Content-Type-Options",
-    "Strict-Transport-Security",
-    "Referrer-Policy",
+    'Content-Security-Policy',
+    'X-Frame-Options',
+    'X-Content-Type-Options',
+    'Strict-Transport-Security',
+    'Referrer-Policy',
 )
 
 
@@ -26,9 +24,6 @@ class HeaderFinding:
 
 @dataclass(frozen=True)
 class HeaderCheckReport:
-    url: str
-    final_url: str
-    status_code: int
     findings: list[HeaderFinding]
 
     @property
@@ -36,59 +31,30 @@ class HeaderCheckReport:
         return all(finding.present for finding in self.findings)
 
     def to_dict(self) -> dict[str, Any]:
+        missing_headers = [finding.header for finding in self.findings if not finding.present]
         return {
-            "url": self.url,
-            "final_url": self.final_url,
-            "status_code": self.status_code,
-            "passed": self.passed,
-            "findings": [asdict(finding) for finding in self.findings],
+            'passed': self.passed,
+            'missing_headers': missing_headers,
+            'findings': [asdict(finding) for finding in self.findings],
         }
 
 
-def evaluate_security_headers(headers: Mapping[str, str]) -> list[HeaderFinding]:
-    normalized = {key.lower(): value for key, value in headers.items()}
+def evaluate_security_headers(snapshot: ResponseSnapshot) -> HeaderCheckReport:
     findings: list[HeaderFinding] = []
 
     for header in REQUIRED_HEADERS:
-        value = normalized.get(header.lower())
+        values = [value for value in snapshot.header_values(header) if value.strip()]
         findings.append(
             HeaderFinding(
                 header=header,
-                present=bool(value),
-                value=value,
+                present=bool(values),
+                value=', '.join(values) if values else None,
                 message=(
-                    f"{header} is present."
-                    if value
-                    else f"{header} is missing from the HTTP response."
+                    f'{header} is present.'
+                    if values
+                    else f'{header} is missing from the HTTP response.'
                 ),
             )
         )
 
-    return findings
-
-
-def run_security_headers_check(
-    url: str,
-    *,
-    timeout_seconds: float = 10.0,
-    max_redirects: int = 5,
-    user_agent: str = "web-pt-control-plane/0.1",
-) -> HeaderCheckReport:
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("URL must be an absolute http:// or https:// target.")
-
-    with httpx.Client(
-        follow_redirects=True,
-        headers={"User-Agent": user_agent},
-        max_redirects=max_redirects,
-        timeout=timeout_seconds,
-    ) as client:
-        response = client.get(url)
-
-    return HeaderCheckReport(
-        url=url,
-        final_url=str(response.url),
-        status_code=response.status_code,
-        findings=evaluate_security_headers(response.headers),
-    )
+    return HeaderCheckReport(findings=findings)

@@ -19,6 +19,22 @@ checks:
       - X-Content-Type-Options
       - Strict-Transport-Security
       - Referrer-Policy
+  cookie_security:
+    enabled: true
+    required_attributes:
+      - Secure
+      - HttpOnly
+      - SameSite
+  cors_inspection:
+    enabled: true
+    inspect_headers:
+      - Access-Control-Allow-Origin
+      - Access-Control-Allow-Credentials
+      - Vary
+  transport_security:
+    enabled: true
+    inspect_https_redirects: true
+    inspect_hsts: true
 safety:
   destructive_tests: false
   require_scope_allowlist: true

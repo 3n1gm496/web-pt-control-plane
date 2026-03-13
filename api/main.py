@@ -13,28 +13,32 @@ import httpx
 import yaml
 from fastapi import FastAPI, HTTPException, Query, Request
 
-from checks.security_headers import REQUIRED_HEADERS, run_security_headers_check
+from checks.cookie_security import inspect_cookie_security
+from checks.cors_inspection import inspect_cors_configuration
+from checks.http_probe import fetch_response_snapshot
+from checks.security_headers import REQUIRED_HEADERS, evaluate_security_headers
+from checks.transport_security import inspect_transport_security
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SCOPE_PATH = PROJECT_ROOT / "scope" / "production.yaml"
-POLICY_PATH = PROJECT_ROOT / "policies" / "safe-production.yaml"
+SCOPE_PATH = PROJECT_ROOT / 'scope' / 'production.yaml'
+POLICY_PATH = PROJECT_ROOT / 'policies' / 'safe-production.yaml'
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as handle:
+    with path.open('r', encoding='utf-8') as handle:
         return yaml.safe_load(handle) or {}
 
 
 def canonicalize_host(host: str | None) -> str:
     if not host:
-        raise ValueError("URL must include a hostname.")
-    return host.rstrip(".").lower()
+        raise ValueError('URL must include a hostname.')
+    return host.rstrip('.').lower()
 
 
 def extract_target_host(url: str) -> str:
     parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("URL must be an absolute http:// or https:// target.")
+    if parsed.scheme not in {'http', 'https'} or not parsed.netloc:
+        raise ValueError('URL must be an absolute http:// or https:// target.')
     return canonicalize_host(parsed.hostname)
 
 
@@ -50,7 +54,7 @@ def get_policy_config() -> dict[str, Any]:
 
 def get_allowed_hosts() -> set[str]:
     scope = get_scope_config()
-    hosts = scope.get("hosts", [])
+    hosts = scope.get('hosts', [])
     return {canonicalize_host(host) for host in hosts}
 
 
@@ -86,24 +90,24 @@ class InMemoryRateLimiter:
 
 @lru_cache(maxsize=1)
 def get_rate_limiter() -> InMemoryRateLimiter:
-    rate_limit = get_policy_config().get("rate_limit", {})
+    rate_limit = get_policy_config().get('rate_limit', {})
     return InMemoryRateLimiter(
-        limit=int(rate_limit.get("requests", 5)),
-        window_seconds=int(rate_limit.get("period_seconds", 60)),
+        limit=int(rate_limit.get('requests', 5)),
+        window_seconds=int(rate_limit.get('period_seconds', 60)),
     )
 
 
 app = FastAPI(
-    title="Web PT Control Plane",
-    description="Safe and auditable control plane for non-destructive web checks.",
-    version="0.1.0",
+    title='Web PT Control Plane',
+    description='Safe and auditable control plane for non-destructive web checks.',
+    version='0.2.0',
 )
 
 
-@app.get("/scan")
+@app.get('/scan')
 def scan(
     request: Request,
-    url: str = Query(..., description="Absolute http(s) URL to a host that is in scope."),
+    url: str = Query(..., description='Absolute http(s) URL to a host that is in scope.'),
 ) -> dict[str, Any]:
     try:
         target_host = extract_target_host(url)
@@ -117,46 +121,60 @@ def scan(
             detail=f"Host '{target_host}' is not listed in scope/production.yaml.",
         )
 
-    client_ip = request.client.host if request.client else "unknown"
-    allowed, retry_after = get_rate_limiter().check(f"{client_ip}:{target_host}")
+    client_ip = request.client.host if request.client else 'unknown'
+    allowed, retry_after = get_rate_limiter().check(f'{client_ip}:{target_host}')
     if not allowed:
         raise HTTPException(
             status_code=429,
             detail=f"Rate limit exceeded for host '{target_host}'.",
-            headers={"Retry-After": str(retry_after)},
+            headers={'Retry-After': str(retry_after)},
         )
 
     policy = get_policy_config()
-    network = policy.get("network", {})
+    network = policy.get('network', {})
 
     try:
-        result = run_security_headers_check(
+        snapshot = fetch_response_snapshot(
             url,
-            timeout_seconds=float(network.get("timeout_seconds", 10)),
-            max_redirects=int(network.get("max_redirects", 5)),
-            user_agent=str(network.get("user_agent", "web-pt-control-plane/0.1")),
+            timeout_seconds=float(network.get('timeout_seconds', 10)),
+            max_redirects=int(network.get('max_redirects', 5)),
+            user_agent=str(network.get('user_agent', 'web-pt-control-plane/0.1')),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except httpx.HTTPError as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"Unable to retrieve target URL safely: {exc}",
+            detail=f'Unable to retrieve target URL safely: {exc}',
         ) from exc
 
+    security_headers = evaluate_security_headers(snapshot)
+    cookie_security = inspect_cookie_security(snapshot)
+    cors = inspect_cors_configuration(snapshot)
+    transport = inspect_transport_security(snapshot)
+
     return {
-        "target": {
-            "url": url,
-            "host": target_host,
-            "in_scope": True,
+        'target': {
+            'url': url,
+            'host': target_host,
+            'in_scope': True,
         },
-        "policy": {
-            "name": policy.get("name", "safe-production"),
-            "destructive_tests": bool(
-                policy.get("safety", {}).get("destructive_tests", False)
+        'policy': {
+            'name': policy.get('name', 'safe-production'),
+            'destructive_tests': bool(
+                policy.get('safety', {}).get('destructive_tests', False)
             ),
-            "rate_limit": policy.get("rate_limit", {}),
-            "allowed_headers": list(REQUIRED_HEADERS),
+            'rate_limit': policy.get('rate_limit', {}),
+            'allowed_headers': list(REQUIRED_HEADERS),
+            'enabled_checks': list(policy.get('checks', {}).keys()),
         },
-        "result": result.to_dict(),
+        'result': {
+            'requested_url': snapshot.requested_url,
+            'final_url': snapshot.final_url,
+            'status_code': snapshot.status_code,
+            'security_headers': security_headers.to_dict(),
+            'cookie_security': cookie_security.to_dict(),
+            'cors': cors.to_dict(),
+            'transport': transport.to_dict(),
+        },
     }
