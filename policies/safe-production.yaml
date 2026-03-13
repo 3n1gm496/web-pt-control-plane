@@ -35,6 +35,36 @@ checks:
     enabled: true
     inspect_https_redirects: true
     inspect_hsts: true
+  endpoint_inventory:
+    enabled: true
+    max_pages: 10
+    max_depth: 2
+    parse_html_only_for_link_extraction: true
+  authorization_matrix:
+    enabled: true
+    max_endpoints: 20
+    compare_headers:
+      - cache-control
+      - location
+      - content-type
+    body_markers:
+      - login
+      - sign in
+      - unauthorized
+      - forbidden
+      - access denied
+      - admin
+      - dashboard
+    profiles:
+      guest:
+        headers: {}
+        cookies: {}
+      user:
+        headers: {}
+        cookies: {}
+      admin:
+        headers: {}
+        cookies: {}
 safety:
   destructive_tests: false
   require_scope_allowlist: true

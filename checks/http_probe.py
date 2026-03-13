@@ -13,6 +13,7 @@ class ResponseSnapshot:
     status_code: int
     headers: dict[str, list[str]]
     redirect_count: int
+    body_text: str | None = None
 
     def header_values(self, name: str) -> list[str]:
         return list(self.headers.get(name.lower(), []))
@@ -34,6 +35,7 @@ def fetch_response_snapshot(
     timeout_seconds: float = 10.0,
     max_redirects: int = 5,
     user_agent: str = 'web-pt-control-plane/0.1',
+    include_body: bool = False,
 ) -> ResponseSnapshot:
     validate_absolute_http_url(url)
 
@@ -49,10 +51,12 @@ def fetch_response_snapshot(
     for name, value in response.headers.multi_items():
         headers[name.lower()].append(value)
 
+    body_text = response.text if include_body else None
     return ResponseSnapshot(
         requested_url=url,
         final_url=str(response.url),
         status_code=response.status_code,
         headers=dict(headers),
         redirect_count=len(response.history),
+        body_text=body_text,
     )

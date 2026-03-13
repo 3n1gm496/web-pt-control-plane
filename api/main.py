@@ -13,8 +13,10 @@ import httpx
 import yaml
 from fastapi import FastAPI, HTTPException, Query, Request
 
+from checks.authz_matrix import analyze_authorization_matrix
 from checks.cookie_security import inspect_cookie_security
 from checks.cors_inspection import inspect_cors_configuration
+from checks.endpoint_inventory import crawl_inventory
 from checks.http_probe import fetch_response_snapshot
 from checks.security_headers import REQUIRED_HEADERS, evaluate_security_headers
 from checks.transport_security import inspect_transport_security
@@ -97,18 +99,7 @@ def get_rate_limiter() -> InMemoryRateLimiter:
     )
 
 
-app = FastAPI(
-    title='Web PT Control Plane',
-    description='Safe and auditable control plane for non-destructive web checks.',
-    version='0.2.0',
-)
-
-
-@app.get('/scan')
-def scan(
-    request: Request,
-    url: str = Query(..., description='Absolute http(s) URL to a host that is in scope.'),
-) -> dict[str, Any]:
+def authorize_target_request(request: Request, url: str) -> tuple[str, dict[str, Any]]:
     try:
         target_host = extract_target_host(url)
     except ValueError as exc:
@@ -130,7 +121,44 @@ def scan(
             headers={'Retry-After': str(retry_after)},
         )
 
-    policy = get_policy_config()
+    return target_host, get_policy_config()
+
+
+def build_policy_summary(policy: dict[str, Any]) -> dict[str, Any]:
+    checks = policy.get('checks', {})
+    inventory = checks.get('endpoint_inventory', {})
+    authz = checks.get('authorization_matrix', {})
+    return {
+        'name': policy.get('name', 'safe-production'),
+        'destructive_tests': bool(policy.get('safety', {}).get('destructive_tests', False)),
+        'rate_limit': policy.get('rate_limit', {}),
+        'allowed_headers': list(REQUIRED_HEADERS),
+        'enabled_checks': list(checks.keys()),
+        'inventory_limits': {
+            'max_pages': int(inventory.get('max_pages', 10)),
+            'max_depth': int(inventory.get('max_depth', 2)),
+        },
+        'authorization_matrix': {
+            'max_endpoints': int(authz.get('max_endpoints', 20)),
+            'compare_headers': list(authz.get('compare_headers', [])),
+            'profiles': list((authz.get('profiles') or {}).keys()),
+        },
+    }
+
+
+app = FastAPI(
+    title='Web PT Control Plane',
+    description='Safe and auditable control plane for non-destructive web checks.',
+    version='0.4.0',
+)
+
+
+@app.get('/scan')
+def scan(
+    request: Request,
+    url: str = Query(..., description='Absolute http(s) URL to a host that is in scope.'),
+) -> dict[str, Any]:
+    target_host, policy = authorize_target_request(request, url)
     network = policy.get('network', {})
 
     try:
@@ -154,20 +182,8 @@ def scan(
     transport = inspect_transport_security(snapshot)
 
     return {
-        'target': {
-            'url': url,
-            'host': target_host,
-            'in_scope': True,
-        },
-        'policy': {
-            'name': policy.get('name', 'safe-production'),
-            'destructive_tests': bool(
-                policy.get('safety', {}).get('destructive_tests', False)
-            ),
-            'rate_limit': policy.get('rate_limit', {}),
-            'allowed_headers': list(REQUIRED_HEADERS),
-            'enabled_checks': list(policy.get('checks', {}).keys()),
-        },
+        'target': {'url': url, 'host': target_host, 'in_scope': True},
+        'policy': build_policy_summary(policy),
         'result': {
             'requested_url': snapshot.requested_url,
             'final_url': snapshot.final_url,
@@ -177,4 +193,71 @@ def scan(
             'cors': cors.to_dict(),
             'transport': transport.to_dict(),
         },
+    }
+
+
+@app.get('/inventory')
+def inventory(
+    request: Request,
+    url: str = Query(..., description='Absolute http(s) URL to a host that is in scope.'),
+) -> dict[str, Any]:
+    target_host, policy = authorize_target_request(request, url)
+    network = policy.get('network', {})
+    inventory_config = policy.get('checks', {}).get('endpoint_inventory', {})
+
+    try:
+        report = crawl_inventory(
+            url,
+            allowed_hosts=get_allowed_hosts(),
+            timeout_seconds=float(network.get('timeout_seconds', 10)),
+            max_redirects=int(network.get('max_redirects', 5)),
+            user_agent=str(network.get('user_agent', 'web-pt-control-plane/0.1')),
+            max_pages=int(inventory_config.get('max_pages', 10)),
+            max_depth=int(inventory_config.get('max_depth', 2)),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f'Unable to inventory target URL safely: {exc}') from exc
+
+    return {
+        'target': {'url': url, 'host': target_host, 'in_scope': True},
+        'policy': build_policy_summary(policy),
+        'result': report.to_dict(),
+    }
+
+
+@app.get('/authz/analyze')
+def authz_analyze(
+    request: Request,
+    url: str = Query(..., description='Absolute http(s) URL to a host that is in scope.'),
+) -> dict[str, Any]:
+    target_host, policy = authorize_target_request(request, url)
+    network = policy.get('network', {})
+    authz_config = policy.get('checks', {}).get('authorization_matrix', {})
+    inventory_config = policy.get('checks', {}).get('endpoint_inventory', {})
+
+    try:
+        report = analyze_authorization_matrix(
+            seed_url=url,
+            allowed_hosts=get_allowed_hosts(),
+            timeout_seconds=float(network.get('timeout_seconds', 10)),
+            max_redirects=int(network.get('max_redirects', 5)),
+            user_agent=str(network.get('user_agent', 'web-pt-control-plane/0.1')),
+            inventory_max_pages=int(inventory_config.get('max_pages', 10)),
+            inventory_max_depth=int(inventory_config.get('max_depth', 2)),
+            max_endpoints=int(authz_config.get('max_endpoints', 20)),
+            compare_headers=list(authz_config.get('compare_headers', [])),
+            body_markers=list(authz_config.get('body_markers', [])),
+            profiles=authz_config.get('profiles', {}),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f'Unable to analyze authorization safely: {exc}') from exc
+
+    return {
+        'target': {'url': url, 'host': target_host, 'in_scope': True},
+        'policy': build_policy_summary(policy),
+        'result': report.to_dict(),
     }
